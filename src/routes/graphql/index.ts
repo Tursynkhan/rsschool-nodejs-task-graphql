@@ -1,51 +1,23 @@
 import { FastifyPluginAsyncTypebox } from '@fastify/type-provider-typebox';
 import { createGqlResponseSchema, gqlResponseSchema } from './schemas.js';
 import { graphql, GraphQLSchema } from 'graphql';
-import { makeExecutableSchema } from '@graphql-tools/schema';
-import depthLimit from 'graphql-depth-limit';
-import DataLoader from 'dataloader';
-import { parseResolveInfo } from 'graphql-parse-resolve-info';
-import { loadResolvers } from './users/index'; // This is an example; adjust based on actual resolver structure
+import { parse, validate, execute } from 'graphql';
+import { PrismaClient, User, Profile, Post, MemberType } from '@prisma/client';
+import { join } from 'path';
+import { readFileSync } from 'fs';
+import { createLoaders } from './loader.js';
+import { createSchema } from './schema.js';
+import { depthLimitRule } from './rules.js';
 
-// Define the GraphQL schema using code-first approach
-const schema = makeExecutableSchema({
-  typeDefs: `
-    type User {
-      id: ID!
-      name: String!
-      posts: [Post]
-    }
-
-    type Post {
-      id: ID!
-      title: String!
-      content: String!
-      user: User
-    }
-
-    type Query {
-      users: [User]
-      user(id: ID!): User
-      posts: [Post]
-      post(id: ID!): Post
-    }
-
-    type Mutation {
-      createUser(name: String!): User
-      createPost(title: String!, content: String!, userId: ID!): Post
-    }
-  `,
-  resolvers: loadResolvers(),
-});
+interface ContextValue {
+  prisma: PrismaClient;
+  loaders?: ReturnType<typeof createLoaders>;
+}
 
 const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
   const { prisma } = fastify;
 
-  // Set up Dataloader for batching user data requests to prevent the N+1 problem
-  const userLoader = new DataLoader(async (keys) => {
-    const users = await prisma.user.findMany({ where: { id: { in: keys as number[] } } });
-    return keys.map((key) => users.find((user) => user.id === key));
-  });
+  const schema = createSchema();
 
   fastify.route({
     url: '/',
@@ -56,23 +28,31 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
         200: gqlResponseSchema,
       },
     },
-    async handler(req, reply) {
+    async handler(req) {
       const { query, variables } = req.body;
 
-      const result = await graphql({
-        schema,
-        source: query,
-        variableValues: variables,
-        contextValue: {
-          prisma,
-          loaders: {
-            userLoader,
-          },
-        },
-        validationRules: [depthLimit(5)],
-      });
+      const contextValue: ContextValue = { prisma };
+      contextValue.loaders = createLoaders(contextValue);
 
-      return reply.send(result);
+      try {
+        const documentAST = parse(query);
+
+        const validationErrors = validate(schema, documentAST, [depthLimitRule]);
+        if (validationErrors.length > 0) {
+          return { errors: validationErrors };
+        }
+
+        const result = await execute({
+          schema,
+          document: documentAST,
+          variableValues: variables,
+          contextValue,
+        });
+
+        return result;
+      } catch (error) {
+        return { errors: [error] };
+      }
     },
   });
 };
